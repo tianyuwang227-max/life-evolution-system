@@ -9,4 +9,4 @@ ACCESS_MODE = "access"
 [[d1_databases]]
 binding = "DB"
 database_name = "life_evolution_db"
-database_id = "REPLACE_WITH_D1_ID"
+database_id = "5fcc07a8-05cd-417d-9eda-f9b4926ef580"
