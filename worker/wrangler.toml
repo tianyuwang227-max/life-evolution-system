@@ -3,7 +3,7 @@ main = "src/index.ts"
 compatibility_date = "2026-03-20"
 
 [vars]
-CORS_ORIGIN = "http://localhost:5173"
+CORS_ORIGIN = "https://claytianyu.com.cn"
 ACCESS_MODE = "access"
 
 [[d1_databases]]
