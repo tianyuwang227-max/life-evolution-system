@@ -1,0 +1,9 @@
+{
+  "name": "life-evolution-system-worker",
+  "private": true,
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "d1:execute": "npx wrangler d1 execute life_evolution_db --file=./schema.sql"
+  }
+}

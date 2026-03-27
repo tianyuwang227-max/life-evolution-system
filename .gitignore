@@ -1,2 +1,11 @@
 life/
 life-evolution-system/
+node_modules/
+dist/
+.env
+.env.*
+.dev.vars
+.wrangler/
+web/node_modules/
+web/dist/
+worker/node_modules/
