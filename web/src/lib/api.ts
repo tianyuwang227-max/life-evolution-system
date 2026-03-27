@@ -25,7 +25,11 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     headers.set("X-Bypass-Secret", BYPASS);
   }
 
-  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers,
+    credentials: options.credentials ?? "include",
+  });
   if (!res.ok) {
     const detail = await res.text();
     throw new Error(detail || `Request failed: ${res.status}`);

@@ -34,13 +34,27 @@ function json(data: unknown, status = 200, corsHeaders: Record<string, string> =
   });
 }
 
-function corsHeaders(env: Env) {
-  const origin = env.CORS_ORIGIN || "*";
-  return {
+function resolveAllowedOrigin(env: Env, requestOrigin: string | null) {
+  const raw = env.CORS_ORIGIN || "*";
+  const allowed = raw.split(",").map((item) => item.trim()).filter(Boolean);
+  if (allowed.length === 0) return "*";
+  if (allowed.includes("*")) return "*";
+  if (requestOrigin && allowed.includes(requestOrigin)) return requestOrigin;
+  return allowed[0];
+}
+
+function corsHeaders(env: Env, request: Request) {
+  const requestOrigin = request.headers.get("Origin");
+  const origin = resolveAllowedOrigin(env, requestOrigin);
+  const headers: Record<string, string> = {
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, CF-Access-Jwt-Assertion, X-Bypass-Secret",
   };
+  if (origin !== "*") {
+    headers["Access-Control-Allow-Credentials"] = "true";
+  }
+  return headers;
 }
 
 function isAuthorized(request: Request, env: Env) {
@@ -75,7 +89,7 @@ async function parseBody(request: Request) {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const cors = corsHeaders(env);
+    const cors = corsHeaders(env, request);
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: cors });

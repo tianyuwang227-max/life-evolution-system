@@ -1,9 +1,11 @@
 name = "life-evolution-system-api"
 main = "src/index.ts"
 compatibility_date = "2026-03-20"
+workers_dev = true
+routes = ["api.claytianyu.com.cn/*"]
 
 [vars]
-CORS_ORIGIN = "https://claytianyu.com.cn"
+CORS_ORIGIN = "https://life.claytianyu.com.cn,https://claytianyu.com.cn"
 ACCESS_MODE = "access"
 
 [[d1_databases]]
