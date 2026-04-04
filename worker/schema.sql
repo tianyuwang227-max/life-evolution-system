@@ -103,11 +103,46 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS auth_credentials (
+  credential_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  user_name TEXT NOT NULL,
+  public_key TEXT NOT NULL,
+  counter INTEGER NOT NULL DEFAULT 0,
+  transports TEXT,
+  device_type TEXT,
+  backed_up INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  last_used_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS auth_challenges (
+  flow_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('register', 'login')),
+  challenge TEXT NOT NULL,
+  origin TEXT NOT NULL,
+  user_id TEXT,
+  user_name TEXT,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+  session_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  user_name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL
+);
+
 INSERT OR IGNORE INTO settings (key, value) VALUES ('initial_savings', '0');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('body_weight_kg', '70');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('exercise_daily_min', '20');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('exercise_insufficient_days', '7');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('calorie_target', '2000');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('auth_user_name', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('auth_user_id', '');
 
 INSERT OR IGNORE INTO prompts (id, group_name, question, enabled, order_index, created_at) VALUES
   (1, '每日复盘', '今天我做了什么？', 1, 1, '2026-03-20'),

@@ -1,11 +1,29 @@
+import {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+} from "@simplewebauthn/server";
+import type {
+  AuthenticationResponseJSON,
+  RegistrationResponseJSON,
+  WebAuthnCredential,
+} from "@simplewebauthn/server";
+
 export interface Env {
   DB: D1Database;
   CORS_ORIGIN?: string;
-  ACCESS_MODE?: string;
   ACCESS_BYPASS_SECRET?: string;
+  AUTH_ALLOWED_ORIGINS?: string;
+  AUTH_BOOTSTRAP_SECRET?: string;
+  AUTH_RP_ID?: string;
+  AUTH_RP_NAME?: string;
+  AUTH_SESSION_COOKIE?: string;
+  AUTH_SESSION_DAYS?: string;
 }
 
 const TZ = "Asia/Shanghai";
+const CHALLENGE_TTL_MS = 10 * 60 * 1000;
 
 function nowISO() {
   return new Date().toISOString();
@@ -34,9 +52,15 @@ function json(data: unknown, status = 200, corsHeaders: Record<string, string> =
   });
 }
 
+function splitCSV(raw: string | undefined, fallback = "") {
+  return (raw ?? fallback)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function resolveAllowedOrigin(env: Env, requestOrigin: string | null) {
-  const raw = env.CORS_ORIGIN || "*";
-  const allowed = raw.split(",").map((item) => item.trim()).filter(Boolean);
+  const allowed = splitCSV(env.CORS_ORIGIN, "*");
   if (allowed.length === 0) return "*";
   if (allowed.includes("*")) return "*";
   if (requestOrigin && allowed.includes(requestOrigin)) return requestOrigin;
@@ -57,17 +81,551 @@ function corsHeaders(env: Env, request: Request) {
   return headers;
 }
 
-function isAuthorized(request: Request, env: Env) {
-  const mode = env.ACCESS_MODE || "access";
-  if (mode === "off") return true;
+function getAllowedOrigins(env: Env) {
+  return splitCSV(env.AUTH_ALLOWED_ORIGINS, env.CORS_ORIGIN);
+}
 
+function getRequestOrigin(request: Request, env: Env) {
+  const origin = request.headers.get("Origin");
+  const allowed = getAllowedOrigins(env);
+  if (!origin || !allowed.includes(origin)) {
+    return null;
+  }
+  return origin;
+}
+
+function textToBytes(value: string) {
+  return new TextEncoder().encode(value);
+}
+
+function bytesToBase64URL(value: Uint8Array) {
+  let binary = "";
+  for (const byte of value) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64URLToBytes(value: string) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
+  const binary = atob(padded);
+  const result = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    result[i] = binary.charCodeAt(i);
+  }
+  return result;
+}
+
+function randomToken() {
+  return crypto.randomUUID();
+}
+
+function parseCookies(request: Request) {
+  const header = request.headers.get("Cookie");
+  const cookies = new Map<string, string>();
+  if (!header) return cookies;
+  for (const item of header.split(";")) {
+    const [name, ...rest] = item.trim().split("=");
+    if (!name) continue;
+    cookies.set(name, rest.join("="));
+  }
+  return cookies;
+}
+
+function getSessionCookieName(env: Env) {
+  return env.AUTH_SESSION_COOKIE || "life_session";
+}
+
+function getSessionMaxAge(env: Env) {
+  const days = Number(env.AUTH_SESSION_DAYS || 30);
+  return Number.isFinite(days) && days > 0 ? Math.round(days * 24 * 60 * 60) : 30 * 24 * 60 * 60;
+}
+
+function buildSessionCookie(env: Env, value: string, maxAge: number) {
+  const parts = [
+    `${getSessionCookieName(env)}=${value}`,
+    "Path=/",
+    "HttpOnly",
+    "Secure",
+    "SameSite=Lax",
+    `Max-Age=${maxAge}`,
+  ];
+  return parts.join("; ");
+}
+
+async function getSetting(env: Env, key: string) {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first();
+  return row?.value ? String(row.value) : "";
+}
+
+async function setSetting(env: Env, key: string, value: string) {
+  await env.DB.prepare(
+    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  ).bind(key, value).run();
+}
+
+async function countCredentials(env: Env) {
+  const row = await env.DB.prepare("SELECT COUNT(*) as total FROM auth_credentials").first();
+  return Number(row?.total || 0);
+}
+
+async function listCredentials(env: Env) {
+  const rows = await env.DB.prepare("SELECT * FROM auth_credentials ORDER BY created_at ASC").all();
+  return (rows.results || []) as Array<Record<string, unknown>>;
+}
+
+async function getCredential(env: Env, credentialID: string) {
+  const row = await env.DB.prepare(
+    "SELECT * FROM auth_credentials WHERE credential_id = ?"
+  ).bind(credentialID).first();
+  return row as Record<string, unknown> | null;
+}
+
+function mapCredential(row: Record<string, unknown>): WebAuthnCredential {
+  return {
+    id: String(row.credential_id),
+    publicKey: base64URLToBytes(String(row.public_key)),
+    counter: Number(row.counter || 0),
+    transports: row.transports ? JSON.parse(String(row.transports)) : [],
+  };
+}
+
+async function cleanupAuthArtifacts(env: Env) {
+  const now = nowISO();
+  await env.DB.prepare("DELETE FROM auth_challenges WHERE expires_at <= ?").bind(now).run();
+  await env.DB.prepare("DELETE FROM auth_sessions WHERE expires_at <= ?").bind(now).run();
+}
+
+async function storeChallenge(
+  env: Env,
+  input: {
+    kind: "register" | "login";
+    challenge: string;
+    origin: string;
+    userId?: string;
+    userName?: string;
+  }
+) {
+  const flowId = randomToken();
+  const createdAt = nowISO();
+  const expiresAt = new Date(Date.now() + CHALLENGE_TTL_MS).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO auth_challenges
+      (flow_id, kind, challenge, origin, user_id, user_name, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    flowId,
+    input.kind,
+    input.challenge,
+    input.origin,
+    input.userId ?? null,
+    input.userName ?? null,
+    createdAt,
+    expiresAt
+  ).run();
+  return flowId;
+}
+
+async function getChallenge(env: Env, flowId: string, kind: "register" | "login") {
+  const row = await env.DB.prepare(
+    "SELECT * FROM auth_challenges WHERE flow_id = ? AND kind = ?"
+  ).bind(flowId, kind).first();
+  if (!row) return null;
+  if (String(row.expires_at) <= nowISO()) {
+    await env.DB.prepare("DELETE FROM auth_challenges WHERE flow_id = ?").bind(flowId).run();
+    return null;
+  }
+  return row as Record<string, unknown>;
+}
+
+async function deleteChallenge(env: Env, flowId: string) {
+  await env.DB.prepare("DELETE FROM auth_challenges WHERE flow_id = ?").bind(flowId).run();
+}
+
+async function createSession(env: Env, userId: string, userName: string) {
+  const sessionId = randomToken();
+  const createdAt = nowISO();
+  const expiresAt = new Date(Date.now() + getSessionMaxAge(env) * 1000).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO auth_sessions
+      (session_id, user_id, user_name, created_at, expires_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(sessionId, userId, userName, createdAt, expiresAt, createdAt).run();
+  return {
+    sessionId,
+    cookie: buildSessionCookie(env, sessionId, getSessionMaxAge(env)),
+    expiresAt,
+  };
+}
+
+async function getSession(request: Request, env: Env) {
+  const sessionId = parseCookies(request).get(getSessionCookieName(env));
+  if (!sessionId) return null;
+  const row = await env.DB.prepare(
+    "SELECT * FROM auth_sessions WHERE session_id = ? AND expires_at > ?"
+  ).bind(sessionId, nowISO()).first();
+  if (!row) return null;
+  await env.DB.prepare(
+    "UPDATE auth_sessions SET last_seen_at = ? WHERE session_id = ?"
+  ).bind(nowISO(), sessionId).run();
+  return row as Record<string, unknown>;
+}
+
+async function deleteSession(request: Request, env: Env) {
+  const sessionId = parseCookies(request).get(getSessionCookieName(env));
+  if (sessionId) {
+    await env.DB.prepare("DELETE FROM auth_sessions WHERE session_id = ?").bind(sessionId).run();
+  }
+  return buildSessionCookie(env, "", 0);
+}
+
+async function getAuthorizedUser(request: Request, env: Env) {
   const bypass = env.ACCESS_BYPASS_SECRET;
   if (bypass && request.headers.get("x-bypass-secret") === bypass) {
-    return true;
+    return {
+      user_id: "bypass",
+      user_name: "开发绕过",
+    };
+  }
+  return getSession(request, env);
+}
+
+function jsonWithHeaders(
+  data: unknown,
+  status = 200,
+  corsHeaders: Record<string, string> = {},
+  extraHeaders: Record<string, string> = {}
+) {
+  const response = json(data, status, corsHeaders);
+  Object.entries(extraHeaders).forEach(([key, value]) => response.headers.set(key, value));
+  return response;
+}
+
+function isLoopbackHost(hostname: string) {
+  return hostname === "localhost" || hostname === "127.0.0.1";
+}
+
+function getRpID(env: Env, origin: string | null) {
+  const configured = env.AUTH_RP_ID || "claytianyu.com.cn";
+  if (!origin) return configured;
+  try {
+    const hostname = new URL(origin).hostname;
+    return isLoopbackHost(hostname) ? hostname : configured;
+  } catch {
+    return configured;
+  }
+}
+
+function getRpName(env: Env) {
+  return env.AUTH_RP_NAME || "人生逆袭系统";
+}
+
+type AuthStatusPayload = {
+  authenticated: boolean;
+  hasPasskey: boolean;
+  setupRequired: boolean;
+  userName: string | null;
+  sessionExpiresAt: string | null;
+};
+
+async function buildAuthStatus(env: Env, user: Record<string, unknown> | null = null): Promise<AuthStatusPayload> {
+  const hasPasskey = (await countCredentials(env)) > 0;
+  const configuredUserName = await getSetting(env, "auth_user_name");
+  return {
+    authenticated: Boolean(user),
+    hasPasskey,
+    setupRequired: !hasPasskey,
+    userName: user?.user_name ? String(user.user_name) : configuredUserName || null,
+    sessionExpiresAt: user?.expires_at ? String(user.expires_at) : null,
+  };
+}
+
+function getErrorMessage(error: unknown) {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return String(error);
+}
+
+async function handleAuthRequest(
+  request: Request,
+  env: Env,
+  cors: Record<string, string>,
+  segments: string[]
+) {
+  if (request.method === "GET" && segments.length === 2 && segments[1] === "status") {
+    const user = await getAuthorizedUser(request, env);
+    return json(await buildAuthStatus(env, user), 200, cors);
   }
 
-  const accessJwt = request.headers.get("cf-access-jwt-assertion");
-  return Boolean(accessJwt);
+  if (request.method === "POST" && segments.length === 2 && segments[1] === "logout") {
+    const cookie = await deleteSession(request, env);
+    return jsonWithHeaders({ ok: true }, 200, cors, { "Set-Cookie": cookie });
+  }
+
+  if (request.method === "POST" && segments.length === 3 && segments[1] === "register" && segments[2] === "options") {
+    const origin = getRequestOrigin(request, env);
+    if (!origin) {
+      return json({ error: "Origin not allowed" }, 400, cors);
+    }
+
+    const credentialTotal = await countCredentials(env);
+    const body = await parseBody(request);
+    let userId = "";
+    let userName = "";
+
+    if (credentialTotal === 0) {
+      const expectedSecret = env.AUTH_BOOTSTRAP_SECRET?.trim();
+      if (!expectedSecret) {
+        return json({ error: "AUTH_BOOTSTRAP_SECRET not configured" }, 500, cors);
+      }
+      const bootstrapSecret = typeof body?.bootstrapSecret === "string" ? body.bootstrapSecret.trim() : "";
+      if (bootstrapSecret !== expectedSecret) {
+        return json({ error: "Bootstrap secret invalid" }, 401, cors);
+      }
+      userName = typeof body?.userName === "string" ? body.userName.trim() : "";
+      if (!userName) {
+        return json({ error: "userName required" }, 400, cors);
+      }
+      userId = (await getSetting(env, "auth_user_id")) || crypto.randomUUID();
+    } else {
+      const user = await getAuthorizedUser(request, env);
+      if (!user) {
+        return json({ error: "Passkey already configured，请直接登录" }, 409, cors);
+      }
+      userId = String(user.user_id);
+      userName = String(user.user_name);
+    }
+
+    const credentials = await listCredentials(env);
+    const rpID = getRpID(env, origin);
+    const options = await generateRegistrationOptions({
+      rpName: getRpName(env),
+      rpID,
+      userID: textToBytes(userId),
+      userName,
+      userDisplayName: userName,
+      excludeCredentials: credentials.map((row) => ({
+        id: String(row.credential_id),
+        transports: row.transports ? JSON.parse(String(row.transports)) : [],
+      })),
+      attestationType: "none",
+      authenticatorSelection: {
+        residentKey: "preferred",
+        userVerification: "preferred",
+      },
+      preferredAuthenticatorType: "localDevice",
+    });
+
+    const flowId = await storeChallenge(env, {
+      kind: "register",
+      challenge: options.challenge,
+      origin,
+      userId,
+      userName,
+    });
+
+    return json({ flowId, options, userName, rpID, rpName: getRpName(env) }, 200, cors);
+  }
+
+  if (request.method === "POST" && segments.length === 3 && segments[1] === "register" && segments[2] === "verify") {
+    const body = (await parseBody(request)) as
+      | {
+          flowId?: string;
+          response?: RegistrationResponseJSON;
+        }
+      | null;
+    if (!body?.flowId || !body.response) {
+      return json({ error: "flowId and response required" }, 400, cors);
+    }
+
+    const challenge = await getChallenge(env, body.flowId, "register");
+    if (!challenge) {
+      return json({ error: "Challenge expired, 请重新发起注册" }, 400, cors);
+    }
+
+    let verification;
+    try {
+      verification = await verifyRegistrationResponse({
+        response: body.response,
+        expectedChallenge: String(challenge.challenge),
+        expectedOrigin: String(challenge.origin),
+        expectedRPID: getRpID(env, String(challenge.origin)),
+        requireUserVerification: true,
+      });
+    } catch (error) {
+      await deleteChallenge(env, body.flowId);
+      return json({ error: "Passkey 注册校验失败", detail: getErrorMessage(error) }, 400, cors);
+    }
+
+    await deleteChallenge(env, body.flowId);
+
+    if (!verification.verified || !verification.registrationInfo) {
+      return json({ error: "Passkey 注册失败" }, 400, cors);
+    }
+
+    const userId = String(challenge.user_id || "");
+    const userName = String(challenge.user_name || "");
+    if (!userId || !userName) {
+      return json({ error: "用户信息丢失，请重新发起注册" }, 400, cors);
+    }
+
+    const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo;
+    const now = nowISO();
+    await env.DB.prepare(
+      `INSERT INTO auth_credentials
+        (credential_id, user_id, user_name, public_key, counter, transports, device_type, backed_up, created_at, last_used_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(credential_id) DO UPDATE SET
+          user_id = excluded.user_id,
+          user_name = excluded.user_name,
+          public_key = excluded.public_key,
+          counter = excluded.counter,
+          transports = excluded.transports,
+          device_type = excluded.device_type,
+          backed_up = excluded.backed_up,
+          last_used_at = excluded.last_used_at`
+    ).bind(
+      credential.id,
+      userId,
+      userName,
+      bytesToBase64URL(credential.publicKey),
+      credential.counter,
+      JSON.stringify(body.response.response.transports ?? []),
+      credentialDeviceType,
+      credentialBackedUp ? 1 : 0,
+      now,
+      now
+    ).run();
+
+    await setSetting(env, "auth_user_id", userId);
+    await setSetting(env, "auth_user_name", userName);
+
+    const session = await createSession(env, userId, userName);
+    const status = await buildAuthStatus(env, {
+      user_id: userId,
+      user_name: userName,
+      expires_at: session.expiresAt,
+    });
+
+    return jsonWithHeaders(status, 200, cors, { "Set-Cookie": session.cookie });
+  }
+
+  if (request.method === "POST" && segments.length === 3 && segments[1] === "login" && segments[2] === "options") {
+    const origin = getRequestOrigin(request, env);
+    if (!origin) {
+      return json({ error: "Origin not allowed" }, 400, cors);
+    }
+
+    const credentials = await listCredentials(env);
+    if (!credentials.length) {
+      return json({ error: "还没有配置 Passkey，请先完成初始注册" }, 404, cors);
+    }
+
+    const rpID = getRpID(env, origin);
+    const options = await generateAuthenticationOptions({
+      rpID,
+      allowCredentials: credentials.map((row) => ({
+        id: String(row.credential_id),
+        transports: row.transports ? JSON.parse(String(row.transports)) : [],
+      })),
+      userVerification: "preferred",
+    });
+
+    const flowId = await storeChallenge(env, {
+      kind: "login",
+      challenge: options.challenge,
+      origin,
+    });
+
+    return json(
+      {
+        flowId,
+        options,
+        userName: (await getSetting(env, "auth_user_name")) || null,
+        rpID,
+        rpName: getRpName(env),
+      },
+      200,
+      cors
+    );
+  }
+
+  if (request.method === "POST" && segments.length === 3 && segments[1] === "login" && segments[2] === "verify") {
+    const body = (await parseBody(request)) as
+      | {
+          flowId?: string;
+          response?: AuthenticationResponseJSON;
+        }
+      | null;
+    if (!body?.flowId || !body.response) {
+      return json({ error: "flowId and response required" }, 400, cors);
+    }
+
+    const challenge = await getChallenge(env, body.flowId, "login");
+    if (!challenge) {
+      return json({ error: "Challenge expired, 请重新发起登录" }, 400, cors);
+    }
+
+    const credentialRow = await getCredential(env, body.response.id);
+    if (!credentialRow) {
+      await deleteChallenge(env, body.flowId);
+      return json({ error: "未找到对应的 Passkey，请重新注册" }, 404, cors);
+    }
+
+    let verification;
+    try {
+      verification = await verifyAuthenticationResponse({
+        response: body.response,
+        expectedChallenge: String(challenge.challenge),
+        expectedOrigin: String(challenge.origin),
+        expectedRPID: getRpID(env, String(challenge.origin)),
+        credential: mapCredential(credentialRow),
+        requireUserVerification: true,
+      });
+    } catch (error) {
+      await deleteChallenge(env, body.flowId);
+      return json({ error: "Passkey 登录校验失败", detail: getErrorMessage(error) }, 400, cors);
+    }
+
+    await deleteChallenge(env, body.flowId);
+
+    if (!verification.verified) {
+      return json({ error: "Passkey 登录失败" }, 400, cors);
+    }
+
+    const { authenticationInfo } = verification;
+    const now = nowISO();
+    const userId = String(credentialRow.user_id);
+    const userName = String(credentialRow.user_name);
+
+    await env.DB.prepare(
+      `UPDATE auth_credentials
+        SET counter = ?, device_type = ?, backed_up = ?, last_used_at = ?
+        WHERE credential_id = ?`
+    ).bind(
+      authenticationInfo.newCounter,
+      authenticationInfo.credentialDeviceType,
+      authenticationInfo.credentialBackedUp ? 1 : 0,
+      now,
+      String(credentialRow.credential_id)
+    ).run();
+
+    await setSetting(env, "auth_user_id", userId);
+    await setSetting(env, "auth_user_name", userName);
+
+    const session = await createSession(env, userId, userName);
+    const status = await buildAuthStatus(env, {
+      user_id: userId,
+      user_name: userName,
+      expires_at: session.expiresAt,
+    });
+
+    return jsonWithHeaders(status, 200, cors, { "Set-Cookie": session.cookie });
+  }
+
+  return json({ error: "Not Found" }, 404, cors);
 }
 
 function buildUpdate(input: Record<string, unknown>, allowed: string[]) {
@@ -90,6 +648,9 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const cors = corsHeaders(env, request);
+    const path = url.pathname.replace("/api", "");
+    const segments = path.split("/").filter(Boolean);
+    const resource = segments[0];
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: cors });
@@ -99,18 +660,21 @@ export default {
       return new Response("Not Found", { status: 404 });
     }
 
-    if (!isAuthorized(request, env)) {
-      return json({ error: "Unauthorized" }, 401, cors);
-    }
-
     try {
-      const path = url.pathname.replace("/api", "");
-      const segments = path.split("/").filter(Boolean);
-      const resource = segments[0];
+      await cleanupAuthArtifacts(env);
       const id = segments[1] ? Number(segments[1]) : null;
 
       if (resource === "health") {
         return json({ ok: true, time: nowISO() }, 200, cors);
+      }
+
+      if (resource === "auth") {
+        return handleAuthRequest(request, env, cors, segments);
+      }
+
+      const user = await getAuthorizedUser(request, env);
+      if (!user) {
+        return json({ error: "Unauthorized" }, 401, cors);
       }
 
       if (resource === "tasks") {

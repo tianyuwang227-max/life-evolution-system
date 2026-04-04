@@ -1,3 +1,10 @@
+import type {
+  AuthenticationResponseJSON,
+  PublicKeyCredentialCreationOptionsJSON,
+  PublicKeyCredentialRequestOptionsJSON,
+  RegistrationResponseJSON,
+} from "@simplewebauthn/browser";
+
 export type Task = {
   id: number;
   date: string;
@@ -137,4 +144,38 @@ export type ExerciseSummary = {
     occurrences: number;
     avg_minutes: number;
   }>;
+};
+
+export type AuthStatus = {
+  authenticated: boolean;
+  hasPasskey: boolean;
+  setupRequired: boolean;
+  userName: string | null;
+  sessionExpiresAt: string | null;
+};
+
+export type PasskeyRegistrationOptions = {
+  flowId: string;
+  userName: string;
+  rpID: string;
+  rpName: string;
+  options: PublicKeyCredentialCreationOptionsJSON;
+};
+
+export type PasskeyLoginOptions = {
+  flowId: string;
+  userName: string | null;
+  rpID: string;
+  rpName: string;
+  options: PublicKeyCredentialRequestOptionsJSON;
+};
+
+export type PasskeyRegistrationVerifyPayload = {
+  flowId: string;
+  response: RegistrationResponseJSON;
+};
+
+export type PasskeyLoginVerifyPayload = {
+  flowId: string;
+  response: AuthenticationResponseJSON;
 };

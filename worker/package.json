@@ -1,6 +1,9 @@
 {
   "name": "life-evolution-system-worker",
   "private": true,
+  "dependencies": {
+    "@simplewebauthn/server": "^13.3.0"
+  },
   "scripts": {
     "dev": "npx wrangler dev",
     "deploy": "npx wrangler deploy",

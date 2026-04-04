@@ -1,4 +1,5 @@
 import type {
+  AuthStatus,
   Task,
   ScheduleBlock,
   DailyReview,
@@ -13,10 +14,34 @@ import type {
   ExerciseLog,
   DietLog,
   ExerciseSummary,
+  PasskeyLoginOptions,
+  PasskeyLoginVerifyPayload,
+  PasskeyRegistrationOptions,
+  PasskeyRegistrationVerifyPayload,
 } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8787";
 const BYPASS = import.meta.env.VITE_BYPASS_SECRET;
+
+function formatErrorMessage(detail: string, status: number) {
+  if (!detail) {
+    return `Request failed: ${status}`;
+  }
+
+  try {
+    const parsed = JSON.parse(detail) as { error?: string; detail?: string };
+    if (parsed.error && parsed.detail) {
+      return `${parsed.error}: ${parsed.detail}`;
+    }
+    if (parsed.error) {
+      return parsed.error;
+    }
+  } catch {
+    // Keep original plain-text error below.
+  }
+
+  return detail;
+}
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers || {});
@@ -32,9 +57,48 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   });
   if (!res.ok) {
     const detail = await res.text();
-    throw new Error(detail || `Request failed: ${res.status}`);
+    throw new Error(formatErrorMessage(detail, res.status));
   }
   return (await res.json()) as T;
+}
+
+export function getAuthStatus() {
+  return request<AuthStatus>(`/api/auth/status`);
+}
+
+export function createPasskeyRegistrationOptions(payload: { userName: string; bootstrapSecret: string }) {
+  return request<PasskeyRegistrationOptions>(`/api/auth/register/options`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function verifyPasskeyRegistration(payload: PasskeyRegistrationVerifyPayload) {
+  return request<AuthStatus>(`/api/auth/register/verify`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function createPasskeyLoginOptions() {
+  return request<PasskeyLoginOptions>(`/api/auth/login/options`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export function verifyPasskeyLogin(payload: PasskeyLoginVerifyPayload) {
+  return request<AuthStatus>(`/api/auth/login/verify`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function logout() {
+  return request<{ ok: true }>(`/api/auth/logout`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
 export function getSummary(date: string) {

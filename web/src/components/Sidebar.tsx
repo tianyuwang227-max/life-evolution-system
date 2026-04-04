@@ -13,7 +13,13 @@ const navItems = [
   { path: "/health", label: "系统健康", desc: "风险提示" },
 ];
 
-export default function Sidebar() {
+type SidebarProps = {
+  userName?: string | null;
+  loggingOut?: boolean;
+  onLogout?: () => void;
+};
+
+export default function Sidebar({ userName, loggingOut = false, onLogout }: SidebarProps) {
   return (
     <aside className="sidebar">
       <div className="sidebar-header">
@@ -33,6 +39,20 @@ export default function Sidebar() {
           </NavLink>
         ))}
       </nav>
+      <div className="sidebar-footer">
+        <div className="sidebar-user">
+          <strong>{userName || "已登录用户"}</strong>
+          <small>Passkey 会话已生效</small>
+        </div>
+        <button
+          type="button"
+          className="btn btn-ghost sidebar-logout"
+          onClick={onLogout}
+          disabled={loggingOut}
+        >
+          {loggingOut ? "退出中..." : "退出登录"}
+        </button>
+      </div>
     </aside>
   );
 }
